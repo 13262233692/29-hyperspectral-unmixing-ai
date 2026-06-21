@@ -5,8 +5,10 @@ from .autoencoder import (
     Decoder1D,
     LinearDecoder,
     SADLoss,
+    SAMLoss,
     MSE_SAD_Loss,
     AbundanceSparsityLoss,
+    clip_gradients,
 )
 from .memory_manager import (
     MemoryManager,
@@ -25,8 +27,10 @@ __all__ = [
     "Decoder1D",
     "LinearDecoder",
     "SADLoss",
+    "SAMLoss",
     "MSE_SAD_Loss",
     "AbundanceSparsityLoss",
+    "clip_gradients",
     "MemoryManager",
     "MemoryConfig",
     "DeviceType",

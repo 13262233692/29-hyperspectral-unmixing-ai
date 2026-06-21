@@ -311,51 +311,234 @@ class SADLoss(nn.Module):
     """光谱角距离（Spectral Angle Distance）损失
     
     衡量两个光谱向量之间的角度，对光照变化不敏感
+    
+    数值稳定层：
+    1. 死像元/零向量掩码过滤
+    2. 双精度 eps 防除零
+    3. 双层 cosine 截断（宽松 + 严格）
+    4. NaN/Inf 末级防护
+    5. acos 边界保护替换策略
     """
 
-    def __init__(self):
+    EPS_DIV: float = 1e-10
+    EPS_CLAMP: float = 1e-6
+    NORM_THRESHOLD: float = 1e-8
+
+    def __init__(self, eps_div: float = 1e-10, eps_clamp: float = 1e-6):
         super().__init__()
+        self.EPS_DIV = eps_div
+        self.EPS_CLAMP = eps_clamp
 
     def forward(self, x_pred: torch.Tensor, x_true: torch.Tensor) -> torch.Tensor:
-        dot_product = torch.sum(x_pred * x_true, dim=1)
-        norm_pred = torch.norm(x_pred, dim=1)
-        norm_true = torch.norm(x_true, dim=1)
+        assert x_pred.shape == x_true.shape, f"形状不匹配: {x_pred.shape} vs {x_true.shape}"
 
-        cos_angle = dot_product / (norm_pred * norm_true + 1e-8)
+        x_pred_safe = torch.nan_to_num(x_pred, nan=0.0, posinf=0.0, neginf=0.0)
+        x_true_safe = torch.nan_to_num(x_true, nan=0.0, posinf=0.0, neginf=0.0)
+
+        norm_pred = torch.norm(x_pred_safe, dim=1, p=2)
+        norm_true = torch.norm(x_true_safe, dim=1, p=2)
+
+        valid_mask = (norm_pred > self.NORM_THRESHOLD) & (norm_true > self.NORM_THRESHOLD)
+
+        if not torch.any(valid_mask):
+            return torch.tensor(0.0, device=x_pred.device, dtype=x_pred.dtype)
+
+        dot_product = torch.sum(x_pred_safe * x_true_safe, dim=1)
+
+        denom = norm_pred * norm_true + self.EPS_DIV
+        denom = torch.clamp(denom, min=self.EPS_DIV)
+
+        cos_angle = dot_product / denom
+
+        cos_angle = torch.nan_to_num(cos_angle, nan=0.0, posinf=1.0, neginf=-1.0)
         cos_angle = torch.clamp(cos_angle, -1.0, 1.0)
+        cos_angle = torch.clamp(cos_angle, -1.0 + self.EPS_CLAMP, 1.0 - self.EPS_CLAMP)
+
         sad = torch.acos(cos_angle)
 
-        return torch.mean(sad)
+        sad = torch.nan_to_num(sad, nan=0.0, posinf=0.0, neginf=0.0)
+
+        sad_valid = sad[valid_mask]
+
+        if sad_valid.numel() == 0:
+            return torch.tensor(0.0, device=x_pred.device, dtype=x_pred.dtype)
+
+        return torch.mean(sad_valid)
+
+
+class SAMLoss(nn.Module):
+    """光谱角映射（Spectral Angle Mapper）损失
+    
+    SAM = (1/π) * arccos(cos(angle))
+    归一化到 [0, 1] 区间，便于与 MSE 组合
+    完整实现死像元防护与数值稳定层
+    """
+
+    EPS_DIV: float = 1e-10
+    EPS_CLAMP: float = 1e-6
+    NORM_THRESHOLD: float = 1e-8
+
+    def __init__(self, eps_div: float = 1e-10, eps_clamp: float = 1e-6):
+        super().__init__()
+        self.EPS_DIV = eps_div
+        self.EPS_CLAMP = eps_clamp
+        self._inv_pi = 1.0 / 3.141592653589793
+
+    def forward(self, x_pred: torch.Tensor, x_true: torch.Tensor) -> torch.Tensor:
+        assert x_pred.shape == x_true.shape
+
+        x_pred_safe = torch.nan_to_num(x_pred, nan=0.0, posinf=0.0, neginf=0.0)
+        x_true_safe = torch.nan_to_num(x_true, nan=0.0, posinf=0.0, neginf=0.0)
+
+        norm_pred = torch.norm(x_pred_safe, dim=1, p=2)
+        norm_true = torch.norm(x_true_safe, dim=1, p=2)
+
+        valid_mask = (norm_pred > self.NORM_THRESHOLD) & (norm_true > self.NORM_THRESHOLD)
+
+        if not torch.any(valid_mask):
+            return torch.tensor(0.0, device=x_pred.device, dtype=x_pred.dtype)
+
+        dot_product = torch.sum(x_pred_safe * x_true_safe, dim=1)
+
+        denom = norm_pred * norm_true + self.EPS_DIV
+        denom = torch.clamp(denom, min=self.EPS_DIV)
+
+        cos_angle = dot_product / denom
+
+        cos_angle = torch.nan_to_num(cos_angle, nan=0.0, posinf=1.0, neginf=-1.0)
+        cos_angle = torch.clamp(cos_angle, -1.0, 1.0)
+        cos_angle = torch.clamp(cos_angle, -1.0 + self.EPS_CLAMP, 1.0 - self.EPS_CLAMP)
+
+        sam = self._inv_pi * torch.acos(cos_angle)
+
+        sam = torch.nan_to_num(sam, nan=0.0, posinf=0.0, neginf=0.0)
+
+        sam_valid = sam[valid_mask]
+        if sam_valid.numel() == 0:
+            return torch.tensor(0.0, device=x_pred.device, dtype=x_pred.dtype)
+
+        return torch.mean(sam_valid)
 
 
 class MSE_SAD_Loss(nn.Module):
     """MSE + SAD 组合损失
     
     MSE 关注绝对数值，SAD 关注光谱形状
+    
+    数值稳定层：
+    1. 死像元掩码过滤（零向量不参与 SAD 计算）
+    2. NaN/Inf 全链路清除
+    3. 末级 NaN 防护返回 0
     """
 
-    def __init__(self, alpha: float = 0.5):
+    def __init__(self, alpha: float = 0.5, eps_div: float = 1e-10, eps_clamp: float = 1e-6):
         super().__init__()
         self.alpha = alpha
-        self.mse = nn.MSELoss()
-        self.sad = SADLoss()
+        self.mse = nn.MSELoss(reduction="mean")
+        self.sad = SADLoss(eps_div=eps_div, eps_clamp=eps_clamp)
+        self._norm_threshold = 1e-8
 
     def forward(self, x_pred: torch.Tensor, x_true: torch.Tensor) -> torch.Tensor:
-        mse_loss = self.mse(x_pred, x_true)
-        sad_loss = self.sad(x_pred, x_true)
-        return self.alpha * mse_loss + (1 - self.alpha) * sad_loss
+        x_pred_safe = torch.nan_to_num(x_pred, nan=0.0, posinf=0.0, neginf=0.0)
+        x_true_safe = torch.nan_to_num(x_true, nan=0.0, posinf=0.0, neginf=0.0)
+
+        norm_true = torch.norm(x_true_safe, dim=1, p=2)
+        valid_mask = norm_true > self._norm_threshold
+
+        mse_loss = self.mse(x_pred_safe, x_true_safe)
+        mse_loss = torch.nan_to_num(mse_loss, nan=0.0, posinf=1e6, neginf=0.0)
+
+        if torch.any(valid_mask):
+            sad_loss = self.sad(x_pred_safe[valid_mask], x_true_safe[valid_mask])
+        else:
+            sad_loss = torch.tensor(0.0, device=x_pred.device, dtype=x_pred.dtype)
+
+        sad_loss = torch.nan_to_num(sad_loss, nan=0.0, posinf=1e6, neginf=0.0)
+
+        total = self.alpha * mse_loss + (1 - self.alpha) * sad_loss
+        total = torch.nan_to_num(total, nan=0.0, posinf=1e6, neginf=0.0)
+
+        return total
 
 
 class AbundanceSparsityLoss(nn.Module):
     """丰度稀疏性正则化
     
     鼓励丰度向量稀疏，符合实际地质场景（像元通常由少数矿物主导）
+    
+    数值稳定层：
+    1. 算术下溢防护（极小值截断到 min_val）
+    2. Softmax 输出的 log 防零（避免 log(0) = -inf）
+    3. 死像元零向量过滤
+    4. NaN/Inf 末级防护
     """
 
-    def __init__(self, beta: float = 0.01):
+    def __init__(self, beta: float = 0.01, min_val: float = 1e-12):
         super().__init__()
         self.beta = beta
+        self.MIN_VAL = min_val
 
     def forward(self, abundances: torch.Tensor) -> torch.Tensor:
-        entropy = -torch.sum(abundances * torch.log(abundances + 1e-8), dim=1)
-        return self.beta * torch.mean(entropy)
+        ab = torch.nan_to_num(abundances, nan=0.0, posinf=0.0, neginf=0.0)
+
+        ab_sum = torch.sum(ab, dim=1)
+        valid_mask = ab_sum > 1e-8
+
+        if not torch.any(valid_mask):
+            return torch.tensor(0.0, device=abundances.device, dtype=abundances.dtype)
+
+        ab_valid = ab[valid_mask]
+
+        ab_clamped = torch.clamp(ab_valid, min=self.MIN_VAL)
+
+        log_ab = torch.log(ab_clamped)
+        log_ab = torch.nan_to_num(log_ab, nan=-27.63, posinf=0.0, neginf=-27.63)
+
+        entropy = -torch.sum(ab_valid * log_ab, dim=1)
+
+        entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
+
+        mean_entropy = torch.mean(entropy)
+        mean_entropy = torch.nan_to_num(mean_entropy, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return self.beta * mean_entropy
+
+
+def clip_gradients(model: nn.Module, max_norm: float = 1.0, norm_type: float = 2.0) -> float:
+    """梯度裁剪阀门
+    
+    防止梯度爆炸，对 NaN/Inf 梯度进行清零处理
+    
+    Args:
+        model: 待裁剪的模型
+        max_norm: 最大范数阈值
+        norm_type: 范数类型（2 为 L2 范数）
+    
+    Returns:
+        裁剪前的总范数（用于日志监控）
+    """
+    parameters = [p for p in model.parameters() if p.grad is not None]
+
+    if len(parameters) == 0:
+        return 0.0
+
+    for p in parameters:
+        if p.grad is not None:
+            p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    if norm_type == float("inf"):
+        total_norm = max(p.grad.detach().abs().max().item() for p in parameters)
+    else:
+        total_norm = torch.norm(
+            torch.stack([torch.norm(p.grad.detach(), norm_type) for p in parameters]),
+            norm_type,
+        ).item()
+
+    if total_norm > max_norm:
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in model.parameters() if p.grad is not None],
+            max_norm=max_norm,
+            norm_type=norm_type,
+        )
+
+    return total_norm

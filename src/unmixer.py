@@ -16,6 +16,7 @@ from .autoencoder import (
     Autoencoder1D,
     MSE_SAD_Loss,
     AbundanceSparsityLoss,
+    clip_gradients,
 )
 from .memory_manager import MemoryManager, MemoryConfig, DeviceType
 
@@ -74,9 +75,44 @@ class UnmixingConfig:
 
     seed: int = 42
 
+    gradient_clip: bool = True
+    gradient_clip_max_norm: float = 1.0
+    gradient_clip_norm_type: float = 2.0
+
+    detect_dead_pixels: bool = True
+    dead_pixel_threshold: float = 1e-8
+    dead_pixel_interpolate: bool = True
+
+    nan_detection: bool = True
+    nan_skip_batches: bool = True
+    nan_reset_on_failure: bool = True
+
+    loss_eps_div: float = 1e-10
+    loss_eps_clamp: float = 1e-6
+    sparsity_min_val: float = 1e-12
+
     @classmethod
     def default(cls) -> "UnmixingConfig":
         return cls()
+
+    @classmethod
+    def robust(cls) -> "UnmixingConfig":
+        """针对高污染数据的鲁棒配置"""
+        return cls(
+            gradient_clip=True,
+            gradient_clip_max_norm=0.5,
+            detect_dead_pixels=True,
+            dead_pixel_interpolate=True,
+            nan_detection=True,
+            nan_skip_batches=True,
+            nan_reset_on_failure=True,
+            loss_eps_div=1e-8,
+            loss_eps_clamp=1e-5,
+            sparsity_min_val=1e-10,
+            sparsity_beta=0.005,
+            num_epochs=300,
+            early_stopping_patience=40,
+        )
 
 
 class SpectralUnmixer:
@@ -121,9 +157,78 @@ class SpectralUnmixer:
         self.model = self.model.to(self.memory_manager.get_device())
 
     def _preprocess(self, cube: HyperSpectralCube) -> HyperSpectralCube:
-        """数据预处理"""
+        """数据预处理
+        
+        步骤：
+        1. NaN/Inf 清理
+        2. 死像元/坏像元检测与插值修复
+        3. 归一化
+        """
+        cube.data = np.nan_to_num(
+            cube.data, nan=0.0, posinf=0.0, neginf=0.0, copy=True
+        )
+
+        if self.config.detect_dead_pixels:
+            cube = self._detect_and_repair_dead_pixels(cube)
+
         if self.config.normalize:
             cube = HSIDataLoader.normalize(cube, method=self.config.normalize_method)
+
+        cube.data = np.nan_to_num(
+            cube.data, nan=0.0, posinf=0.0, neginf=0.0, copy=True
+        )
+
+        return cube
+
+    def _detect_and_repair_dead_pixels(self, cube: HyperSpectralCube) -> HyperSpectralCube:
+        """检测并修复死像元/坏带
+        
+        死像元判定：光谱向量的 L2 范数低于阈值（传感器零输出）
+        修复策略：双线性插值填充
+        """
+        bands, lines, samples = cube.shape
+        data = cube.data
+
+        norms = np.sqrt(np.sum(data ** 2, axis=0))
+        dead_mask = norms < self.config.dead_pixel_threshold
+        nan_mask = np.any(np.isnan(data) | np.isinf(data), axis=0)
+        combined_mask = dead_mask | nan_mask
+
+        n_dead = np.sum(combined_mask)
+        if n_dead > 0:
+            total_pixels = lines * samples
+            ratio = n_dead / total_pixels
+
+            if self.config.dead_pixel_interpolate and ratio < 0.5:
+                from scipy.interpolate import griddata
+
+                y_coords, x_coords = np.mgrid[0:lines, 0:samples]
+                valid_mask = ~combined_mask
+
+                if np.any(valid_mask):
+                    valid_points = np.column_stack([y_coords[valid_mask], x_coords[valid_mask]])
+                    query_points = np.column_stack([y_coords[combined_mask], x_coords[combined_mask]])
+
+                    for b in range(bands):
+                        band_data = data[b, :, :]
+                        valid_values = band_data[valid_mask]
+                        if len(valid_values) > 0 and len(query_points) > 0:
+                            try:
+                                filled = griddata(
+                                    valid_points, valid_values, query_points,
+                                    method="linear", fill_value=np.mean(valid_values)
+                                )
+                                band_data[combined_mask] = filled
+                            except Exception:
+                                band_data[combined_mask] = np.mean(valid_values)
+                        data[b, :, :] = band_data
+            elif ratio >= 0.5:
+                global_mean = np.mean(data, axis=(1, 2), keepdims=True)
+                for b in range(bands):
+                    band_mask = combined_mask
+                    data[b, band_mask] = global_mean[b, 0, 0]
+
+        cube.data = data
         return cube
 
     def unmix(
@@ -195,11 +300,19 @@ class SpectralUnmixer:
         batch_size: int,
         verbose: bool,
     ) -> List[float]:
-        """训练自编码器"""
+        """训练自编码器
+        
+        数值稳定性增强：
+        1. 梯度裁剪阀门（防止梯度爆炸）
+        2. NaN/Inf 批量检测与跳过
+        3. 连续 NaN 时自动重置模型
+        4. 每步损失末级防护
+        """
         device = self.memory_manager.get_device()
         self.model.train()
 
         tensor_spectra = torch.from_numpy(pixel_spectra).float()
+        tensor_spectra = torch.nan_to_num(tensor_spectra, nan=0.0, posinf=0.0, neginf=0.0)
         dataset = TensorDataset(tensor_spectra)
         dataloader = DataLoader(
             dataset,
@@ -214,8 +327,15 @@ class SpectralUnmixer:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=self.config.num_epochs
         )
-        recon_loss_fn = MSE_SAD_Loss(alpha=self.config.loss_alpha)
-        sparsity_loss_fn = AbundanceSparsityLoss(beta=self.config.sparsity_beta)
+        recon_loss_fn = MSE_SAD_Loss(
+            alpha=self.config.loss_alpha,
+            eps_div=self.config.loss_eps_div,
+            eps_clamp=self.config.loss_eps_clamp,
+        )
+        sparsity_loss_fn = AbundanceSparsityLoss(
+            beta=self.config.sparsity_beta,
+            min_val=self.config.sparsity_min_val,
+        )
 
         scaler = self.memory_manager.get_grad_scaler()
         use_amp = self.memory_manager.config.enable_mixed_precision and self.memory_manager.is_cuda()
@@ -223,42 +343,139 @@ class SpectralUnmixer:
         loss_history = []
         best_loss = float("inf")
         patience_counter = 0
+        nan_batch_count = 0
+        consecutive_nan_epochs = 0
+        grad_norm_max = 0.0
 
         for epoch in range(self.config.num_epochs):
             epoch_loss = 0.0
-            n_batches = 0
+            n_valid_batches = 0
+            skipped_batches = 0
+            epoch_grad_norms = []
 
-            for batch_data in dataloader:
+            for batch_idx, batch_data in enumerate(dataloader):
                 x = batch_data[0].to(device, non_blocking=True)
+
+                if self.config.nan_detection:
+                    x_has_nan = torch.isnan(x).any() or torch.isinf(x).any()
+                    if x_has_nan:
+                        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
                 optimizer.zero_grad()
 
-                if use_amp:
-                    with torch.cuda.amp.autocast():
+                loss_val = None
+                try:
+                    if use_amp:
+                        with torch.cuda.amp.autocast():
+                            recon, abundances = self.model(x)
+                            recon_loss = recon_loss_fn(recon, x)
+                            sparse_loss = sparsity_loss_fn(abundances)
+                            loss = recon_loss + sparse_loss
+
+                        if self.config.nan_detection and (
+                            torch.isnan(loss) or torch.isinf(loss)
+                        ):
+                            nan_batch_count += 1
+                            if self.config.nan_skip_batches:
+                                skipped_batches += 1
+                                del x, recon, abundances, loss
+                                continue
+
+                        scaler.scale(loss).backward()
+
+                        if self.config.gradient_clip:
+                            scaler.unscale_(optimizer)
+                            gn = clip_gradients(
+                                self.model,
+                                max_norm=self.config.gradient_clip_max_norm,
+                                norm_type=self.config.gradient_clip_norm_type,
+                            )
+                            epoch_grad_norms.append(gn)
+
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
                         recon, abundances = self.model(x)
                         recon_loss = recon_loss_fn(recon, x)
                         sparse_loss = sparsity_loss_fn(abundances)
                         loss = recon_loss + sparse_loss
 
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
+                        if self.config.nan_detection and (
+                            torch.isnan(loss) or torch.isinf(loss)
+                        ):
+                            nan_batch_count += 1
+                            if self.config.nan_skip_batches:
+                                skipped_batches += 1
+                                del x, recon, abundances, loss
+                                continue
+
+                        loss.backward()
+
+                        if self.config.gradient_clip:
+                            gn = clip_gradients(
+                                self.model,
+                                max_norm=self.config.gradient_clip_max_norm,
+                                norm_type=self.config.gradient_clip_norm_type,
+                            )
+                            epoch_grad_norms.append(gn)
+
+                        optimizer.step()
+
+                    loss_val = float(loss.item())
+
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        self.memory_manager.empty_cache()
+                        skipped_batches += 1
+                        continue
+                    elif self.config.nan_detection:
+                        skipped_batches += 1
+                        continue
+                    else:
+                        raise e
+
+                if loss_val is None or np.isnan(loss_val) or np.isinf(loss_val):
+                    loss_val = 0.0
+                    skipped_batches += 1
                 else:
-                    recon, abundances = self.model(x)
-                    recon_loss = recon_loss_fn(recon, x)
-                    sparse_loss = sparsity_loss_fn(abundances)
-                    loss = recon_loss + sparse_loss
+                    epoch_loss += loss_val
+                    n_valid_batches += 1
 
-                    loss.backward()
-                    optimizer.step()
+                del x
+                if "recon" in locals():
+                    try: del recon
+                    except: pass
+                if "abundances" in locals():
+                    try: del abundances
+                    except: pass
+                if "loss" in locals():
+                    try: del loss
+                    except: pass
 
-                epoch_loss += loss.item()
-                n_batches += 1
-                del x, recon, abundances
+            if n_valid_batches == 0:
+                avg_loss = best_loss if best_loss != float("inf") else 1.0
+                consecutive_nan_epochs += 1
+            else:
+                avg_loss = epoch_loss / n_valid_batches
+                consecutive_nan_epochs = 0
 
-            avg_loss = epoch_loss / n_batches
-            loss_history.append(avg_loss)
+            if epoch_grad_norms:
+                grad_norm_max = max(grad_norm_max, max(epoch_grad_norms))
+
+            if np.isnan(avg_loss) or np.isinf(avg_loss):
+                avg_loss = best_loss if best_loss != float("inf") else 1.0
+                consecutive_nan_epochs += 1
+
+            loss_history.append(float(avg_loss))
             scheduler.step()
+
+            if self.config.nan_reset_on_failure and consecutive_nan_epochs >= 5:
+                if verbose:
+                    print(f"Epoch {epoch+1}: 连续 {consecutive_nan_epochs} 轮异常，重置模型参数")
+                self._set_seed()
+                self.model.apply(self._reset_weights)
+                optimizer.state.clear()
+                consecutive_nan_epochs = 0
 
             if avg_loss < best_loss - self.config.early_stopping_min_delta:
                 best_loss = avg_loss
@@ -267,7 +484,14 @@ class SpectralUnmixer:
                 patience_counter += 1
 
             if verbose and (epoch + 1) % 20 == 0:
-                print(f"Epoch {epoch+1}/{self.config.num_epochs}, Loss: {avg_loss:.6f}")
+                msg = f"Epoch {epoch+1}/{self.config.num_epochs}, Loss: {avg_loss:.6f}"
+                if skipped_batches > 0:
+                    msg += f", 跳过: {skipped_batches}"
+                if epoch_grad_norms:
+                    msg += f", |∇L|_max: {max(epoch_grad_norms):.3f}"
+                if nan_batch_count > 0:
+                    msg += f", NaN批: {nan_batch_count}"
+                print(msg)
 
             if patience_counter >= self.config.early_stopping_patience:
                 if verbose:
@@ -277,7 +501,20 @@ class SpectralUnmixer:
             if self.memory_manager.config.auto_gc:
                 self.memory_manager.empty_cache()
 
+        if verbose and grad_norm_max > 0:
+            print(f"训练期间最大梯度范数: {grad_norm_max:.4f}")
+
         return loss_history
+
+    @staticmethod
+    def _reset_weights(m):
+        """重置层权重"""
+        if isinstance(m, (torch.nn.Conv1d, torch.nn.ConvTranspose1d, torch.nn.Linear)):
+            m.reset_parameters()
+        elif isinstance(m, torch.nn.BatchNorm1d):
+            m.reset_running_stats()
+            if m.affine:
+                m.reset_parameters()
 
     def _extract(
         self,
