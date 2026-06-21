@@ -19,6 +19,11 @@ from .autoencoder import (
     clip_gradients,
 )
 from .memory_manager import MemoryManager, MemoryConfig, DeviceType
+from .alteration import (
+    HydrocarbonAlterationAnalyzer,
+    AlterationIndex,
+    AlterationEventHooks,
+)
 
 
 @dataclass
@@ -42,11 +47,22 @@ class UnmixingResult:
     bands: int = 0
     num_endmembers: int = 4
 
+    alteration: Optional[AlterationIndex] = None
+
     def get_abundance_map(self, index: int) -> np.ndarray:
         return self.abundance_maps[index, :, :]
 
     def get_endmember_spectrum(self, index: int) -> np.ndarray:
         return self.endmembers[index, :]
+
+    def has_alteration(self) -> bool:
+        return self.alteration is not None and self.alteration.enrichment_mask is not None
+
+    def get_enrichment_mask(self) -> Optional[np.ndarray]:
+        return self.alteration.enrichment_mask if self.has_alteration() else None
+
+    def get_enrichment_score(self) -> Optional[np.ndarray]:
+        return self.alteration.enrichment_score if self.has_alteration() else None
 
 
 @dataclass
@@ -91,6 +107,13 @@ class UnmixingConfig:
     loss_eps_clamp: float = 1e-6
     sparsity_min_val: float = 1e-12
 
+    enable_alteration_analysis: bool = True
+    alteration_window_1900_half: float = 80.0
+    alteration_window_2300_half: float = 100.0
+    alteration_savgol_window: int = 7
+    alteration_enrichment_percentile: float = 75.0
+    alteration_min_ratio: float = 0.4
+
     @classmethod
     def default(cls) -> "UnmixingConfig":
         return cls()
@@ -112,6 +135,7 @@ class UnmixingConfig:
             sparsity_beta=0.005,
             num_epochs=300,
             early_stopping_patience=40,
+            enable_alteration_analysis=True,
         )
 
 
@@ -133,7 +157,22 @@ class SpectralUnmixer:
         self.model: Optional[Autoencoder1D] = None
         self._is_trained = False
 
+        self.hooks = AlterationEventHooks()
+        self.alteration_analyzer: Optional[HydrocarbonAlterationAnalyzer] = None
+
+        if self.config.enable_alteration_analysis:
+            self._init_alteration_analyzer()
+
         self._set_seed()
+
+    def _init_alteration_analyzer(self):
+        self.alteration_analyzer = HydrocarbonAlterationAnalyzer(
+            window_1900_half=self.config.alteration_window_1900_half,
+            window_2300_half=self.config.alteration_window_2300_half,
+            savgol_window=self.config.alteration_savgol_window,
+            enrichment_percentile=self.config.alteration_enrichment_percentile,
+            min_enrichment_ratio=self.config.alteration_min_ratio,
+        )
 
     def _set_seed(self):
         torch.manual_seed(self.config.seed)
@@ -291,6 +330,28 @@ class SpectralUnmixer:
 
         self._is_trained = True
         self._assign_endmember_names(result)
+
+        self.hooks.fire("after_unmix", result, self, cube)
+
+        if self.config.enable_alteration_analysis and self.alteration_analyzer is not None:
+            try:
+                alteration = self.alteration_analyzer.full_analysis(
+                    endmember_spectra=result.endmembers,
+                    wavelengths=result.wavelengths,
+                    abundance_maps=result.abundance_maps,
+                )
+                result.alteration = alteration
+                self.hooks.fire("after_mask", result, alteration, self, cube)
+                if verbose:
+                    print(f"[蚀变分析] 完成。富集区比例: {alteration.enrichment_fraction:.3%}")
+                    print(f"[蚀变分析] 阈值: {alteration.enrichment_threshold:.4f}")
+                    if alteration.endmember_carbonate_rich:
+                        rich_names = [result.endmember_names[i] for i in alteration.endmember_carbonate_rich]
+                        print(f"[蚀变分析] 碳酸盐富集端元: {rich_names}")
+            except Exception as e:
+                self.hooks.fire("on_error", e, "alteration", self, cube)
+                if verbose:
+                    print(f"[蚀变分析] 跳过 (异常: {e})")
 
         return result
 

@@ -48,6 +48,42 @@ class UnmixingRequest(BaseModel):
     early_stopping_patience: int = Field(default=20, ge=0, description="早停耐心值")
     seed: int = Field(default=42, description="随机种子")
 
+    enable_alteration_analysis: bool = Field(default=True, description="启用烃类蚀变分析旁路")
+    alteration_enrichment_percentile: float = Field(default=75.0, ge=50.0, le=99.0, description="蚀变富集区分位阈值")
+    alteration_min_ratio: float = Field(default=0.4, ge=0.0, description="2300/1900 深度比最小值")
+
+
+class AlterationEndmemberStats(BaseModel):
+    """单端元蚀变统计"""
+
+    endmember_index: int
+    endmember_name: str
+    depth_1900: float
+    depth_2300: float
+    ratio_2300_1900: float
+    is_carbonate_rich: bool
+
+
+class AlterationResponse(BaseModel):
+    """烃类蚀变分析响应"""
+
+    enabled: bool = False
+    success: bool = False
+
+    enrichment_threshold: float = 0.0
+    enrichment_fraction: float = 0.0
+
+    endmember_stats: List[AlterationEndmemberStats] = Field(default_factory=list)
+    carbonate_rich_endmembers: List[int] = Field(default_factory=list)
+
+    enrichment_mask: List[List[int]] = Field(
+        default_factory=list, description="油气蚀变富集区二值化掩膜 (lines, samples), 0/255"
+    )
+    enrichment_score: List[List[float]] = Field(
+        default_factory=list, description="归一化蚀变分数热力图 (lines, samples), [0, 1]"
+    )
+    enrichment_mask_shape: List[int] = Field(default_factory=list)
+
 
 class EndmemberInfo(BaseModel):
     """端元信息"""
@@ -92,6 +128,8 @@ class UnmixingResponse(BaseModel):
     training_epochs: int = 0
 
     processing_time: float = 0.0
+
+    alteration: AlterationResponse = Field(default_factory=AlterationResponse, description="烃类蚀变分析结果")
 
 
 class HealthResponse(BaseModel):

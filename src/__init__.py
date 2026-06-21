@@ -18,6 +18,12 @@ from .memory_manager import (
     MemoryProfiler,
 )
 from .unmixer import SpectralUnmixer, UnmixingResult, UnmixingConfig
+from .alteration import (
+    HydrocarbonAlterationAnalyzer,
+    AlterationIndex,
+    AlterationEventHooks,
+    AbsorptionFeature,
+)
 
 __all__ = [
     "HSIDataLoader",
@@ -39,4 +45,8 @@ __all__ = [
     "SpectralUnmixer",
     "UnmixingResult",
     "UnmixingConfig",
+    "HydrocarbonAlterationAnalyzer",
+    "AlterationIndex",
+    "AlterationEventHooks",
+    "AbsorptionFeature",
 ]

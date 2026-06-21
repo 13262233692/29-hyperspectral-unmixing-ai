@@ -16,6 +16,8 @@ from ..schemas import (
     AbundanceMapInfo,
     ErrorResponse,
     DeviceTypeEnum,
+    AlterationResponse,
+    AlterationEndmemberStats,
 )
 from src import (
     SpectralUnmixer,
@@ -86,6 +88,9 @@ async def unmix_hyperspectral(
     seed: int = Form(42, description="随机种子"),
     batch_size: Optional[int] = Form(None, description="批大小（自动计算）"),
     verbose: bool = Form(False, description="是否输出详细日志"),
+    enable_alteration_analysis: bool = Form(True, description="启用烃类蚀变分析旁路"),
+    alteration_enrichment_percentile: float = Form(75.0, description="蚀变富集区分位阈值"),
+    alteration_min_ratio: float = Form(0.4, description="2300/1900 深度比最小值"),
 ):
     """高光谱数据解编接口
 
@@ -141,6 +146,9 @@ async def unmix_hyperspectral(
                 normalize_method=normalize_method,
                 early_stopping_patience=early_stopping_patience,
                 seed=seed,
+                enable_alteration_analysis=enable_alteration_analysis,
+                alteration_enrichment_percentile=alteration_enrichment_percentile,
+                alteration_min_ratio=alteration_min_ratio,
             )
 
             dev_type = MemDeviceType.AUTO
@@ -189,6 +197,35 @@ async def unmix_hyperspectral(
                     result.abundance_maps[i, :, :].tolist()
                 )
 
+            alteration_resp = AlterationResponse(
+                enabled=enable_alteration_analysis
+            )
+            if result.has_alteration() and result.alteration is not None:
+                alt = result.alteration
+                em_stats = []
+                for i in range(result.num_endmembers):
+                    em_stats.append(AlterationEndmemberStats(
+                        endmember_index=i,
+                        endmember_name=result.endmember_names[i] if i < len(result.endmember_names) else f"Endmember_{i+1}",
+                        depth_1900=float(alt.depth_1900[i]),
+                        depth_2300=float(alt.depth_2300[i]),
+                        ratio_2300_1900=float(alt.ratio_2300_1900[i]),
+                        is_carbonate_rich=(i in (alt.endmember_carbonate_rich or [])),
+                    ))
+                mask_uint8 = alt.get_mask_uint8()
+                score = alt.enrichment_score
+                alteration_resp = AlterationResponse(
+                    enabled=True,
+                    success=True,
+                    enrichment_threshold=float(alt.enrichment_threshold),
+                    enrichment_fraction=float(alt.enrichment_fraction),
+                    endmember_stats=em_stats,
+                    carbonate_rich_endmembers=list(alt.endmember_carbonate_rich or []),
+                    enrichment_mask=mask_uint8.tolist(),
+                    enrichment_score=score.tolist() if score is not None else [],
+                    enrichment_mask_shape=list(mask_uint8.shape),
+                )
+
             processing_time = time.time() - start_time
 
             return UnmixingResponse(
@@ -207,6 +244,7 @@ async def unmix_hyperspectral(
                 loss_history=result.loss_history or [],
                 training_epochs=len(result.loss_history) if result.loss_history else 0,
                 processing_time=processing_time,
+                alteration=alteration_resp,
             )
 
     except HTTPException:
